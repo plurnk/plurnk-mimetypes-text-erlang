@@ -33,8 +33,15 @@ export default class TextErlang extends AntlrExtractor {
 //   functionClause         → function (first clause names the function;
 //                            multi-clause definitions share one symbol)
 //   -import/-export/-include/etc. → excluded (dependency / metadata)
-//   bodies                 → not visited; Erlang clause bodies aren't
-//                            templates that host nested declarations
+//
+// References (SPEC §16) — the call graph, precision over recall:
+//   functionCall: expr800 argumentList; expr800: exprMax (':' exprMax)?
+//     local  foo(Args)      → one exprMax    → call(foo),  container = caller fn
+//     remote Mod:Fun(Args)  → two exprMax     → call(Fun),  container = caller fn
+//   Only atom callees emit. A variable call `F(X)`, an applied fun-expr, or a
+//   macro `?M(...)` has no atom name node → no ref (it can't honestly name-join).
+//   Remote calls name the function part (`Fun`), not the module — `lists:reverse`
+//   emits call(reverse), an honest dead row when no local `reverse/N` exists.
 class TextErlangVisitor extends withExtractor(ErlangVisitor) {
     #emittedFunctions = new Set<string>();
 
@@ -89,8 +96,35 @@ class TextErlangVisitor extends withExtractor(ErlangVisitor) {
         if (this.#emittedFunctions.has(key)) return null;
         this.#emittedFunctions.add(key);
         this.addSymbol("function", name, ctx, params);
+        // Scope the clause bodies so every call site inside carries
+        // container = this function (the @> join key, SPEC §16).
+        this.gateContainer(name, ctx);
         return null;
     };
+
+    visitFunctionCall = (ctx: any): unknown => {
+        // expr800: exprMax (':' exprMax)?  — one part = local, two = remote.
+        const e800 = ctx.expr800?.();
+        const parts = collectChildren(e800, "exprMax");
+        // The callee name node: the function part (last exprMax). For a remote
+        // call that's `Fun` in `Mod:Fun`; for a local call it's the sole atom.
+        const callee = parts[parts.length - 1];
+        const name = atomMaxText(callee);
+        if (name) this.addRef("call", name, callee as never);
+        // Recurse so nested calls inside the argument list are captured too.
+        return this.visitChildren(ctx);
+    };
+}
+
+// An exprMax names a function only when it is a bare atom (exprMax → atomic →
+// tokAtom). Variables, applied fun-expressions, and macros return null and emit
+// no ref — precision over recall (SPEC §16).
+function atomMaxText(exprMax: unknown): string | null {
+    if (!exprMax) return null;
+    const atomic = (exprMax as { atomic?: () => unknown }).atomic?.();
+    if (!atomic) return null;
+    const tokAtom = (atomic as { tokAtom?: () => { getText?: () => string } | null }).tokAtom?.();
+    return tokAtom?.getText?.() ?? null;
 }
 
 // Find the first tokAtom INSIDE the attribute's value (after the attribute
